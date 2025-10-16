@@ -60,6 +60,24 @@ def eta_EE(omega, sum_rate, mu, sum_Po):
     return (omega * sum_rate) / denom
 
 
+def _ensure_vector(x, length, name="vector"):
+    """Ensure x becomes a 1-D numpy array of given length.
+
+    If x is a scalar or a 0-d array, replicate it to the required length.
+    If x has length 1, also replicate. If x has the correct length, return
+    a flattened copy. Otherwise raise a ValueError to surface config issues.
+    """
+    arr = np.array(x, dtype=float)
+    if arr.ndim == 0:
+        return np.full(length, float(arr))
+    if arr.size == 1:
+        return np.full(length, float(arr.ravel()[0]))
+    arr = arr.ravel()
+    if arr.size != length:
+        raise ValueError(f"{name} must be scalar or length {length}, got {arr.size}")
+    return arr
+
+
 def lyapunov_L(Q, H):
     return float(0.5 * (np.sum(Q**2) + np.sum(H**2)))
 
@@ -79,17 +97,13 @@ class MECEnvDDRL(gym.Env):
         self.W_sub = self.W_total / self.K
         self.sigma2 = float(cfg.get("noise", 1e-13))  # ~ -100 dBm
         # CPU capability f_m (cycles/s)
-        self.f_m = np.array(
-            cfg.get("f_m", np.full(self.M, 2.0e9)),  # default 2 GHz per device
-            dtype=float,
+        self.f_m = _ensure_vector(
+            cfg.get("f_m", np.full(self.M, 2.0e9)), self.M, name="f_m"
         )
 
         # Task load L_l (dimensionless task-load term used with f_m^2); allow per-device for flexibility
-        self.L_l = np.array(
-            cfg.get(
-                "L_l", np.full(self.M, 1.0e-9)
-            ),  # small scale so energies are in a reasonable range
-            dtype=float,
+        self.L_l = _ensure_vector(
+            cfg.get("L_l", np.full(self.M, 1.0e-9)), self.M, name="L_l"
         )
 
         # Energy coefficient xi (chip/architecture dependent)
@@ -100,16 +114,20 @@ class MECEnvDDRL(gym.Env):
             cfg.get("psi_lo", np.full(self.M, 1.0e8)),  # cycles needed locally
             dtype=float,
         )
+        # Normalize psi_lo to length M if user provided scalar or wrong shape
+        self.psi_lo = _ensure_vector(self.psi_lo, self.M, name="psi_lo")
         self.psi_off = np.array(
             cfg.get("psi_off", np.full(self.M, 5.0e7)),  # cycles needed at MEC path
             dtype=float,
         )
+        self.psi_off = _ensure_vector(self.psi_off, self.M, name="psi_off")
 
         # Input data size d_m (bits) for offloading latency model
         self.d_m = np.array(
             cfg.get("d_m", np.full(self.M, 1.0e6)),  # 1 Mbit per task by default
             dtype=float,
         )
+        self.d_m = _ensure_vector(self.d_m, self.M, name="d_m")
 
         # For convenience we’ll also track rolling per-slot r_m and p_m
         self._r_m_last = np.zeros(self.M, dtype=float)
@@ -121,7 +139,8 @@ class MECEnvDDRL(gym.Env):
         self.p_max = float(cfg.get("p_max", 2.0))  # per-RRH power cap (per slot)
         self.r_min = float(cfg.get("r_min", 1.0))  # per-link QoS min rate
         Ik_default = np.full(self.K, cfg.get("Ik_value", 0.5), dtype=float)
-        self.Ik = np.array(cfg.get("Ik", Ik_default), dtype=float).reshape(self.K)
+        # Allow Ik to be provided as scalar or length-K; ensure correct shape
+        self.Ik = _ensure_vector(cfg.get("Ik", Ik_default), self.K, name="Ik")
 
         # Reward weights
         self.omega = float(cfg.get("omega", 1.0))
@@ -470,6 +489,10 @@ class MECEnvDDRL(gym.Env):
             "E_total_sum": float(np.sum(E_T_m)),
             "T_local_avg": float(np.mean(T_lo_m)),
             "T_off_avg": float(np.mean(T_off_m)),
+            "E_local_m": E_lo_m.copy(),
+            "E_off_m": E_off_m.copy(),
+            "T_local_m": T_lo_m.copy(),
+            "T_off_m": T_off_m.copy(),
         }
         return obs, reward, terminated, truncated, info
 
@@ -481,27 +504,58 @@ class MECEnvDDRL(gym.Env):
 
 
 # ----------------------- Smoke test -----------------------
-if __name__ == "__main__":
-    env = MECEnvDDRL({"seed": 42})
-    obs, info = env.reset()
-    print("Reset OK:", obs.shape, info)
+def safe_random_action(env):
+    # Start with all idle
+    a = np.zeros(env.L * env.K, dtype=int)  # idx=0 means idle
 
-    total = 0.0
-    invalids = 0
-    for i in range(1000):
-        for t in range(20):
-            a = env.action_space.sample()
+    # Pick one random (l,k) and one random device m
+    l = np.random.randint(env.L)
+    k = np.random.randint(env.K)
+    m = np.random.randint(env.M)
+
+    # Choose a modest nonzero power that fits C1 comfortably
+    # e.g., 1/4 of p_max snapped to nearest available level
+    target_p = min(env.p_max * 0.25, env.power_levels[-1])
+    p_idx = int(np.argmin(np.abs(env.power_levels - target_p)))
+    p_idx = max(1, p_idx)  # ensure nonzero level
+
+    # Map (m, p_idx_nonzero) to the encoded action index for that (l,k)
+    idx_nonzero = m * (env.num_power_levels - 1) + (
+        p_idx - 1
+    )  # 0-based within nonzero block
+    encoded = 1 + idx_nonzero  # +1 since 0 = idle
+    a[l * env.K + k] = encoded
+    return a
+
+
+if __name__ == "__main__":
+    import json
+    from pathlib import Path
+    from logger import EnvLogger
+
+    cfg_path = Path("config.json")
+    cfg = json.loads(cfg_path.read_text()) if cfg_path.exists() else {"seed": 42}
+
+    np.random.seed(cfg.get("seed", 42))
+
+    env = MECEnvDDRL(cfg)
+    logger = EnvLogger()
+
+    episodes = 10
+    steps_per_ep = 50
+
+    for ep in range(episodes):
+        obs, info = env.reset(seed=cfg.get("seed", None))
+        logger.start_episode(ep)
+        for t in range(steps_per_ep):
+            a = safe_random_action(env)  # ← use safe sampler
             obs, r, term, trunc, info = env.step(a)
-            total += r
-            if not info.get("ok", False):
-                invalids += 1
-            if trunc or term:
-                obs, info = env.reset()
-        # print("Random rollout done. reward_sum=", total, "invalids=", invalids)
-        print(
-            "Example slot paper-metrics:",
-            "E_total_sum=",
-            info.get("E_total_sum"),
-            "T_off_avg=",
-            info.get("T_off_avg"),
-        )
+            logger.log_step(r, info)
+            if term or trunc:
+                break
+        logger.end_episode()
+
+    Path("runs").mkdir(exist_ok=True)
+    logger.save_episode_summaries("runs/episode_summaries.csv")
+    logger.save_per_step("runs/per_step.csv")
+    print("Saved logs under runs/")
