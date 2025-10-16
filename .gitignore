@@ -1,2 +1,5 @@
 tempCodeRunnerFile.py
 tempCodeRunnerFile.python
+runs/episode_summaries.csv
+runs/per_step.csv
+__pycache__/logger.cpython-313.pyc
