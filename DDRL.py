@@ -10,10 +10,27 @@ subch = 4
 W = 40e6  # bandwidth
 sigma2 = 1e-13  # noise power
 
+penalty = -1
+
 p_max = 2
+r_min = 1
+I_k = np.array([0.5] * subch)
+print(
+    f"Params: p_max={p_max}, r_min={r_min}, I_k[min]={I_k.min():.3g}, I_k[max]={I_k.max():.3g}, subch={subch}"
+)
+
 
 # reward params
 omega, mu = 1, 1
+
+# status of subchannels (one user per server per k)
+lines = np.zeros((server, subch), dtype=bool)
+
+# status of each slot so the interference can be calculated later
+active = np.empty((server, subch), dtype=object)
+for l in range(server):
+    for k in range(subch):
+        active[l, k] = []  # stores tuples (m, p, |g|)
 
 
 E_max = 1.0  # max battery
@@ -50,10 +67,6 @@ for l in range(server):  # server index
 ### Equations
 
 
-def interference_ok(p, g, I_k):  # Checks if subchannel interference exceeds its limits
-    return p * abs(g) <= I_k
-
-
 def sinr(p, g, interference, sigma2):
     return (p * abs(g)) / (interference + sigma2)
 
@@ -80,23 +93,51 @@ def eta_EE(omega, r, mu, P_o):
     return (omega * r) / denom
 
 
-# assert interference_ok(1.0, 0.5, 1.0) is True
-# assert interference_ok(3.0, 0.5, 1.0) is False
+def begin_slot():
+    lines[:, :] = False
+    for s in range(server):
+        for k in range(subch):
+            active[s, k].clear()
 
-# phi = sinr(1.0, 2.0, interference=0.0, sigma2=1e-13)
-# assert phi > 1e13
 
-# assert abs(rate(1.0, 0.0) - 0.0) < 1e-12
-# assert abs(rate(1.0, 1.0) - np.log2(2.0)) < 1e-12
+# Fali checks
+def check_power(p):
+    if p > p_max:
+        return {
+            "ok": False,
+            "constraint": "power",
+            "p": float(p),
+            "p_max": float(p_max),
+        }
 
-# assert queue_update(5.0, b=2.0, A=1.0) == 4.0
-# assert queue_update(1.0, b=2.0, A=0.5) == 0.5
 
-# assert abs(power_total(0.0, p_c=0.1, p_s=0.05, eps=0.5) - 0.15) < 1e-12
-# assert power_total(1.0, p_c=0.1, p_s=0.05, eps=0.5) > 2.0
+def check_exclusive(l, k):
+    if lines[l, k]:
+        return {"ok": False, "constraint": "busy", "server": int(l), "k": int(k)}
 
-# assert eta_EE(1.0, r=0.0, mu=1.0, P_o=1.0) == 0.0
-# assert abs(eta_EE(1.0, r=10.0, mu=2.0, P_o=5.0) - 1.0) < 1e-12
+
+def check_interference(p, g, k):
+    lhs = float(p * abs(g))
+    rhs = float(I_k[k])
+    if lhs > rhs:
+        return {
+            "ok": False,
+            "constraint": "interference",
+            "lhs": lhs,
+            "rhs": rhs,
+            "k": int(k),
+        }
+
+
+def check_rate(r):
+    if r < r_min:
+        return {
+            "ok": False,
+            "constraint": "rate",
+            "rate": float(r),
+            "r_min": float(r_min),
+        }
+
 
 ### Step once
 
@@ -112,45 +153,55 @@ S = {
 }  # step inputs
 
 
-def step_once(S, server, edge, k, p, I_k, pc, ps, eps, P_T):
+def step_once(S, server, edge, k, p, pc, ps, eps, P_T):
     reward = 0
     info = {}
 
-    # Clamp p for more secure claculation:
-    np.clip(p, 0.0, p_max)
-
     # Draw a random fade for the lmk link and set the device-server fade in the channels grid
     g_lm = np.random.rayleigh(scale=1)
-    S["g"][server][edge] = g_lm
+    S["g"][server, edge] = g_lm
 
-    # If interference limit is exceeded, return negatie reward
-    if not interference_ok(p, g_lm, I_k):
-        reward = -1
-        info = {"ok": False, "constraint": "interference"}
-        return S, reward, info
+    # check and see if the values are ok
+    fail = (
+        check_exclusive(server, k) or check_power(p) or check_interference(p, g_lm, k)
+    )
+    if fail:
+        return S, penalty, fail
+
+    # set the line busy
+    lines[server, k] = True
+
+    # Clamp p for more safe claculation
+    p = float(np.clip(p, 0.0, p_max))
 
     # SINR and rate
-    interference = 0.0  # for now
+    interference = sum(
+        p_i * g_i for (_, p_i, g_i) in active[server][k]
+    )  # calculate interference based on the active users
+    active[server, k].append((edge, p, abs(g_lm)))
     phi = sinr(p, g_lm, interference, sigma2)
     S["phi"].fill(0.0)
     S["phi"][edge] = phi
     S["prev_ch"][edge] = 0.9 * S["prev_ch"][edge] + 0.1 * S["g"][server, edge]
     r = rate(W, phi)  # rate
+    fail = check_rate(r)
+    if fail:
+        return S, penalty, fail
 
     # served bits
     b_lm = r * 1  # 1 is delta time
 
     # bring in a task and update the queue
-    S["A"][server][edge] = np.random.uniform(0, 0.1)
-    new_Q = queue_update(S["Q"][server][edge], b_lm, S["A"][server][edge])
-    S["Q"][server][edge] = new_Q
+    S["A"][server, edge] = np.random.uniform(0, 0.1)
+    new_Q = queue_update(S["Q"][server, edge], b_lm, S["A"][server, edge])
+    S["Q"][server, edge] = new_Q
 
     # Power update
     P_o = power_total(p, pc, ps, eps)
     S["E"][edge] -= drain_rate * P_o
     S["E"][edge] = np.clip(S["E"][edge], 0.0, E_max)
-    new_H = virtual_power_update(S["H"][server][edge], P_tilde=P_o, P_T=P_T)
-    S["H"][server][edge] = new_H
+    new_H = virtual_power_update(S["H"][server, edge], P_tilde=P_o, P_T=P_T)
+    S["H"][server, edge] = new_H
 
     # Local task done
     alpha = 10  # task scale
@@ -183,11 +234,11 @@ def decode_action(idx: int):
 
 
 ### Test
-S["A"][0, 0] = 0.02
-for t in range(10):
-    a_idx = np.random.randint(len(actions))
-    l, m, k, p, x = decode_action(a_idx)
-    S, r, info = step_once(
-        S, server=l, edge=m, k=k, p=p, I_k=1.0, pc=0.1, ps=0.05, eps=0.35, P_T=0.05
-    )
-    print(t, r, info["ok"])
+# S["A"][0, 0] = 0.02
+# for t in range(10):
+#     a_idx = np.random.randint(len(actions))
+#     l, m, k, p, x = decode_action(a_idx)
+#     S, r, info = step_once(
+#         S, server=l, edge=m, k=k, p=p, I_k=I_k, pc=0.1, ps=0.05, eps=0.35, P_T=0.05
+#     )
+#     print(t, r, info["ok"])
