@@ -2,296 +2,409 @@ import gymnasium as gym
 from gymnasium import spaces
 import numpy as np
 
-### System constants
-edge = 15
-server = 2
-subch = 4
 
-W = 40e6  # bandwidth
-sigma2 = 1e-13  # noise power
-
-penalty = -1
-
-p_max = 2
-r_min = 1
-I_k = np.array([0.5] * subch)
-print(
-    f"Params: p_max={p_max}, r_min={r_min}, I_k[min]={I_k.min():.3g}, I_k[max]={I_k.max():.3g}, subch={subch}"
-)
+# ---------- Paper-consistent primitives ----------
 
 
-# reward params
-omega, mu = 1, 1
-
-# status of subchannels (one user per server per k)
-lines = np.zeros((server, subch), dtype=bool)
-
-# status of each slot so the interference can be calculated later
-active = np.empty((server, subch), dtype=object)
-for l in range(server):
-    for k in range(subch):
-        active[l, k] = []  # stores tuples (m, p, |g|)
-
-
-E_max = 1.0  # max battery
-drain_rate = 1e-6  # drain rate for the battery
-
-power_watts = np.arange(
-    0, p_max, 0.1
-)  # Power should be a continous variable in the state of the device but since we need it to be discerete for RL, it's drawn as closely as possible
-
-X_choice = np.array([0, 1])  # 0=local 1=offload
-
-
-seed = 0
-
-g = np.zeros((server, edge))  # channel gain
-Q = np.zeros((server, edge))  # queue
-H = np.zeros((server, edge))  # power
-A = np.zeros((server, edge))  # arrivals
-U = np.zeros(edge)  # local task OBSERVE
-E = np.ones(edge)  # Batteries OBSERVE
-phi = np.zeros(edge)  # SINR OBSERVE
-prev_ch = np.zeros(edge)  # Previous channel for helping future prediction OBSERVE
-
-# Actions
-actions = []
-for l in range(server):  # server index
-    for m in range(edge):  # device index
-        for k in range(subch):  # subchannel index
-            for p_idx in range(len(power_watts)):
-                for x in X_choice:
-                    actions.append((l, m, k, p_idx, int(x)))
-
-
-### Equations
-
-
-def sinr(p, g, interference, sigma2):
-    return (p * abs(g)) / (interference + sigma2)
+def sinr(p, g_abs, interference, sigma2):
+    return (p * g_abs) / (interference + sigma2)
 
 
 def rate(W, phi):
-    return W * np.log2(1 + phi)
+    return W * np.log2(1.0 + max(phi, 0.0))
 
 
 def queue_update(q, b, A):
-    return max(q - b, 0) + A
+    return max(q - b, 0.0) + A
 
 
-def power_total(p_lm, p_c, p_s, eps):
-    eps = max(eps, 1e-20)
-    return float(p_c + p_s + abs(p_lm) / eps)
+def rrh_total_power(p_vec_for_rrh):
+    # Sum of scheduled transmit powers on all subchannels for a given RRH
+    return float(np.sum(p_vec_for_rrh))
+
+
+def rrh_total_power_model(p_sum_rrh, p_c, p_s, eps):
+    eps = max(eps, 1e-12)
+    return float(p_c + p_s + p_sum_rrh / eps)
 
 
 def virtual_power_update(H, P_tilde, P_T):
-    return max(H - P_tilde + P_T, 0)
+    # Eq. (17): per-link virtual queue. We use link transmit-component as P_tilde.
+    return max(H - P_tilde + P_T, 0.0)
 
 
-def eta_EE(omega, r, mu, P_o):
-    denom = max(mu * P_o, 1e-20)
-    return (omega * r) / denom
+def eta_EE(omega, sum_rate, mu, sum_Po):
+    denom = max(mu * sum_Po, 1e-20)
+    return (omega * sum_rate) / denom
 
 
-def begin_slot():
-    lines[:, :] = False
-    for s in range(server):
-        for k in range(subch):
-            active[s, k].clear()
-    S["g"][:] = np.random.rayleigh(scale=1.0, size=(server, edge))
+def lyapunov_L(Q, H):
+    return float(0.5 * (np.sum(Q**2) + np.sum(H**2)))
 
 
-def rrh_total_power(l: int) -> float:
-    total = 0.0
-    for k in range(subch):
-        for _m, p_i, _abs_g in active[l, k]:
-            total += p_i
-    return float(total)
+# ---------- Environment: joint per-slot action ----------
 
 
-def current_interference_at(rrh_l: int, k: int) -> float:
-    itf = 0.0
-    for lp in range(server):
-        if lp == rrh_l:
-            continue
-        for m_prime, p_prime, _abs_g_lp_mprime in active[lp, k]:
-            g_rrhl_mprime = S["g"][rrh_l, m_prime]
-            itf += p_prime * abs(g_rrhl_mprime)
-    return float(itf)
+class MECEnvDDRL(gym.Env):
+    """
+    Joint scheduling & power per slot:
+      - For each (RRH l, subchannel k), choose: idle OR (device m, power level)
+      - Enforces:
+          C1: RRH per-slot total power ≤ p_max
+          C2: per-link rate ≥ r_min (for scheduled links)
+          C3: per-subchannel interference threshold I_k at every RRH receiver
+          C4: exclusivity: at most one device per (l,k) and each device used by at most one RRH (single association)
+      - Updates:
+          Queues Q[l,m] by (7) for all pairs (scheduled: b>0; unscheduled: b=0)
+          Virtual queues H[l,m] by (17) for scheduled links using link transmit component
+      - Reward:
+          System energy-efficiency per slot: (ω * Σ rates) / (μ * Σ RRH total power)
+    """
 
+    metadata = {"render_modes": []}
 
-def adding_this_link_breaks_any_receiver(l: int, m: int, k: int, p: float):
-    # our own receiver l: must already be within I_k[k] given existing others
-    cur_self = current_interference_at(l, k)
-    if cur_self > float(I_k[k]):
-        return True, {
-            "constraint": "C3_interference_self",
-            "lhs": float(cur_self),
-            "rhs": float(I_k[k]),
-            "k": int(k),
-            "receiver": int(l),
-        }
+    def __init__(self, config=None):
+        cfg = config or {}
 
-    # all other receivers on same k: adding our link increases their interference
-    for lp in range(server):
-        if lp == l:
-            continue
-        cur = current_interference_at(lp, k)
-        add = p * abs(S["g"][lp, m])
-        if cur + add > float(I_k[k]):
-            return True, {
-                "constraint": "C3_interference_other",
-                "lhs": float(cur + add),
-                "rhs": float(I_k[k]),
-                "k": int(k),
-                "receiver": int(lp),
-            }
-    return False, None
+        # System / sim params (paper defaults)
+        self.L = int(cfg.get("num_rrh", 2))  # RRHs
+        self.M = int(cfg.get("num_devices", 15))  # devices
+        self.K = int(cfg.get("num_subch", 4))  # subchannels
+        self.W_total = float(cfg.get("bandwidth", 40e6))
+        self.W_sub = self.W_total / self.K
+        self.sigma2 = float(cfg.get("noise", 1e-13))  # ~ -100 dBm
 
+        # Constraints
+        self.p_max = float(cfg.get("p_max", 2.0))  # per-RRH power cap (per slot)
+        self.r_min = float(cfg.get("r_min", 1.0))  # per-link QoS min rate
+        Ik_default = np.full(self.K, cfg.get("Ik_value", 0.5), dtype=float)
+        self.Ik = np.array(cfg.get("Ik", Ik_default), dtype=float).reshape(self.K)
 
-# Fail checks
-def check_power(p):
-    if p > p_max:
-        return {
-            "ok": False,
-            "constraint": "power",
-            "p": float(p),
-            "p_max": float(p_max),
-        }
+        # Reward weights
+        self.omega = float(cfg.get("omega", 1.0))
+        self.mu = float(cfg.get("mu", 1.0))
 
+        # Episode
+        self.episode_len = int(cfg.get("episode_len", 200))
 
-def check_exclusive(l, k):
-    if lines[l, k]:
-        return {"ok": False, "constraint": "busy", "server": int(l), "k": int(k)}
-
-
-def check_interference(p, g, k):
-    lhs = sum(p_i * abs(g_i) for (_, p_i, g_i) in active[server, k]) + p * abs(g_new)
-    rhs = float(I_k[k])
-    if lhs > rhs:
-        return {
-            "ok": False,
-            "constraint": "interference",
-            "lhs": lhs,
-            "rhs": rhs,
-            "k": int(k),
-        }
-
-
-def check_rate(r):
-    if r < r_min:
-        return {
-            "ok": False,
-            "constraint": "rate",
-            "rate": float(r),
-            "r_min": float(r_min),
-        }
-
-
-### Step once
-
-S = {
-    "g": g,
-    "Q": Q,
-    "H": H,
-    "A": A,
-    "U": U,
-    "E": E,
-    "phi": phi,
-    "prev_ch": prev_ch,
-}  # step inputs
-
-
-def step_once(S, server, edge, k, p, pc, ps, eps, P_T):
-    reward = 0.0
-    info = {}
-
-    fail = check_exclusive(server, k)
-    if fail:
-        return S, penalty, fail
-
-    single_cap = check_power(p)
-    if single_cap:
-        return S, penalty, single_cap
-
-    # Then total cap for this RRH in the current slot
-    used_power = rrh_total_power(server)
-    if used_power + p > float(p_max):
-        return (
-            S,
-            penalty,
-            {
-                "ok": False,
-                "constraint": "total power exceeded",
-                "used": float(used_power),
-                "add": float(p),
-                "p_max": float(p_max),
-                "server": int(server),
-            },
+        # Discretized power levels (include 0 via "idle" option separately)
+        self.num_power_levels = int(cfg.get("num_power_levels", 11))
+        self.power_levels = np.linspace(
+            0.0, self.p_max, self.num_power_levels, dtype=float
         )
 
-    breaks, info = adding_this_link_breaks_any_receiver(server, edge, k, p)
-    if breaks:
-        return S, penalty, info
+        # Power model for RRH total power (Eq. 11 components)
+        self.p_c = float(cfg.get("p_c", 0.1))
+        self.p_s = float(cfg.get("p_s", 0.0))
+        self.eps = float(cfg.get("epsilon", 0.5))  # PA drain efficiency
+        self.P_T = float(cfg.get("P_T", 0.5))  # virtual queue target
 
-    # Desired link gain
-    g_lm = S["g"][server, edge]
+        # Internal state
+        self.Q = np.zeros((self.L, self.M), dtype=float)  # data queues
+        self.H = np.zeros((self.L, self.M), dtype=float)  # virtual power queues
+        self.h = np.zeros((self.L, self.M), dtype=float)  # |Rayleigh channel|
 
-    # Interference at OUR receiver (from other RRHs already active on k)
-    interference = current_interference_at(server, k)
+        # Observation = [|h|, Q, H]
+        obs_dim = self.L * self.M * 3
+        self.observation_space = spaces.Box(
+            low=0.0, high=np.finfo(np.float32).max, shape=(obs_dim,), dtype=np.float32
+        )
 
-    p = float(np.clip(p, 0.0, p_max))
-    phi_val = sinr(p, g_lm, interference, sigma2)
-    S["phi"].fill(0.0)
-    S["phi"][edge] = phi_val
-    S["prev_ch"][edge] = 0.9 * S["prev_ch"][edge] + 0.1 * g_lm
-    r = rate(W, phi_val)
+        # Joint action: for each (l,k), choose among [idle] + M*P combos
+        self._choices_per_lk = 1 + self.M * (
+            self.num_power_levels - 1
+        )  # exclude zero power from combos
+        # MultiDiscrete vector length L*K, each entry in [0, choices-1]
+        self.action_space = spaces.MultiDiscrete(
+            [self._choices_per_lk] * (self.L * self.K)
+        )
 
-    fail = check_rate(r)
-    if fail:
-        return S, penalty, fail
+        # Penalty
+        self.invalid_penalty = float(cfg.get("invalid_penalty", -1.0))
 
-    # lock the line and register activity for interference accounting
-    lines[server, k] = True
-    active[server, k].append((edge, p, abs(g_lm)))
+        # RNG / bookkeeping
+        self._rng = np.random.default_rng(cfg.get("seed", None))
+        self._t = 0
+        self._episode_steps = 0
+        self._ep_reward_sum = 0.0
+        self._ep_reward_min = np.inf
+        self._ep_reward_max = -np.inf
 
-    # Served bits over the slot (Δt = 1 for now)
-    b_lm = r * 1.0
+        # Initialize channels
+        self._draw_channels()
 
-    S["A"][server, edge] = np.random.uniform(0, 0.1)
-    new_Q = queue_update(S["Q"][server, edge], b_lm, S["A"][server, edge])
-    S["Q"][server, edge] = new_Q
+    # ---------- helpers ----------
 
-    P_o = power_total(p, pc, ps, eps)
-    S["E"][edge] -= drain_rate * P_o
-    S["E"][edge] = np.clip(S["E"][edge], 0.0, E_max)
-    new_H = virtual_power_update(S["H"][server, edge], P_tilde=P_o, P_T=P_T)
-    S["H"][server, edge] = new_H
+    def _draw_channels(self):
+        self.h[:, :] = self._rng.rayleigh(scale=1.0, size=(self.L, self.M))
 
-    alpha = 10  # task scale
-    S["U"][edge] = max(S["U"][edge] - r / (W * alpha), 0.0)
+    def _build_obs(self):
+        return np.concatenate([self.h.ravel(), self.Q.ravel(), self.H.ravel()]).astype(
+            np.float32
+        )
 
-    reward = eta_EE(omega, r, mu, P_o)
+    def _decode_joint_action(self, a_vec):
+        """
+        Decode MultiDiscrete action into:
+          m_sel[l,k] in {-1..M-1}, p_sel[l,k] >= 0
+          -1 => idle; else device index with nonzero power
+        Mapping:
+          idx=0 => idle
+          idx>=1 => idx-1 => (m, p_idx_nonzero) with p = power_levels[p_idx]
+        """
+        m_sel = -np.ones((self.L, self.K), dtype=int)
+        p_sel = np.zeros((self.L, self.K), dtype=float)
 
-    info = {
-        "phi": float(phi_val),
-        "rate": float(r),
-        "P_o": float(P_o),
-        "battery": float(S["E"][edge]),
-        "q_new": float(new_Q),
-        "H_new": float(new_H),
-        "itf_self": float(interference),
-        "ok": True,
-    }
+        for l in range(self.L):
+            for k in range(self.K):
+                idx = int(a_vec[l * self.K + k])
+                if idx == 0:
+                    continue  # idle
+                idx -= 1
+                m = idx // (self.num_power_levels - 1)
+                p_idx_nz = (
+                    idx % (self.num_power_levels - 1) + 1
+                )  # 1..num_power_levels-1
+                m_sel[l, k] = m
+                p_sel[l, k] = float(self.power_levels[p_idx_nz])
+        return m_sel, p_sel
 
-    return S, reward, info
+    def _interference_matrix(self, m_sel, p_sel):
+        """
+        Compute interference seen at each (l,k) receiver from other RRHs on the same k:
+          I[l,k] = sum_{lp!=l, scheduled} p_sel[lp,k] * |h[l, m_sel[lp,k]]|
+        """
+        I = np.zeros((self.L, self.K), dtype=float)
+        for k in range(self.K):
+            for l in range(self.L):
+                if m_sel[l, k] < 0:
+                    continue  # even if idle, still check against Ik in C3 below
+                itf = 0.0
+                for lp in range(self.L):
+                    if lp == l:
+                        continue
+                    if m_sel[lp, k] >= 0:
+                        m_lp = m_sel[lp, k]
+                        p_lp = p_sel[lp, k]
+                        itf += p_lp * abs(self.h[l, m_lp])
+                I[l, k] = itf
+        return I
+
+    # ---------- gym api ----------
+
+    def reset(self, *, seed=None, options=None):
+        if seed is not None:
+            self._rng = np.random.default_rng(seed)
+        self._t = 0
+        self._episode_steps = 0
+        self.Q.fill(0.0)
+        self.H.fill(0.0)
+        self._draw_channels()
+
+        self._ep_reward_sum = 0.0
+        self._ep_reward_min = np.inf
+        self._ep_reward_max = -np.inf
+
+        obs = self._build_obs()
+        info = {
+            "lyapunov": lyapunov_L(self.Q, self.H),
+            "t": self._t,
+            "episode_steps": self._episode_steps,
+        }
+        return obs, info
+
+    def step(self, action):
+        # Decode joint action
+        m_sel, p_sel = self._decode_joint_action(action)
+
+        # -------- Joint constraint checks --------
+
+        # C4 (exclusivity): each (l,k) has at most one device (by construction), AND
+        # each device m can be scheduled by at most one RRH across all k.
+        # Enforce single association: a device cannot appear in two different l (any k).
+        for m in range(self.M):
+            used_pairs = [
+                (l, k) for l in range(self.L) for k in range(self.K) if m_sel[l, k] == m
+            ]
+            if len(used_pairs) > 1:
+                obs = self._build_obs()
+                return (
+                    obs,
+                    self.invalid_penalty,
+                    False,
+                    False,
+                    {
+                        "ok": False,
+                        "constraint": "C4_single_association",
+                        "device": int(m),
+                        "pairs": used_pairs,
+                    },
+                )
+
+        # C1 (power cap): per RRH total scheduled power ≤ p_max
+        for l in range(self.L):
+            p_sum = rrh_total_power(p_sel[l, :])
+            if p_sum > self.p_max + 1e-12:
+                obs = self._build_obs()
+                return (
+                    obs,
+                    self.invalid_penalty,
+                    False,
+                    False,
+                    {
+                        "ok": False,
+                        "constraint": "C1_power_cap",
+                        "l": int(l),
+                        "p_sum": float(p_sum),
+                        "p_max": float(self.p_max),
+                    },
+                )
+
+        # Compute interference matrix based on the joint schedule
+        I = self._interference_matrix(m_sel, p_sel)
+
+        # C3 (interference threshold per (l,k))
+        for l in range(self.L):
+            for k in range(self.K):
+                if I[l, k] > float(self.Ik[k]) + 1e-12:
+                    obs = self._build_obs()
+                    return (
+                        obs,
+                        self.invalid_penalty,
+                        False,
+                        False,
+                        {
+                            "ok": False,
+                            "constraint": "C3_interference",
+                            "l": int(l),
+                            "k": int(k),
+                            "lhs": float(I[l, k]),
+                            "rhs": float(self.Ik[k]),
+                        },
+                    )
+
+        # C2 (rate minimum) for every scheduled link
+        phi = np.zeros((self.L, self.K), dtype=float)
+        r = np.zeros((self.L, self.K), dtype=float)
+        for l in range(self.L):
+            for k in range(self.K):
+                m = m_sel[l, k]
+                if m < 0:
+                    continue
+                p = p_sel[l, k]
+                g_abs = abs(self.h[l, m])
+                phi[l, k] = sinr(p, g_abs, I[l, k], self.sigma2)
+                r[l, k] = rate(self.W_sub, phi[l, k])
+                if r[l, k] < self.r_min - 1e-12:
+                    obs = self._build_obs()
+                    return (
+                        obs,
+                        self.invalid_penalty,
+                        False,
+                        False,
+                        {
+                            "ok": False,
+                            "constraint": "C2_rate_min",
+                            "l": int(l),
+                            "k": int(k),
+                            "rate": float(r[l, k]),
+                            "r_min": float(self.r_min),
+                        },
+                    )
+
+        # RRH total power + model Po(l) per RRH
+        rrh_p_sums = np.array(
+            [rrh_total_power(p_sel[l, :]) for l in range(self.L)], dtype=float
+        )
+        rrh_Po = np.array(
+            [
+                rrh_total_power_model(rrh_p_sums[l], self.p_c, self.p_s, self.eps)
+                for l in range(self.L)
+            ],
+            dtype=float,
+        )
+
+        # Per-link service b and arrivals A; update Q for all (l,m)
+        # For scheduled (l,k): affects that device m only (b>0), others b=0
+        # Sample arrivals for every (l,m)
+        A = self._rng.uniform(0.0, 0.1, size=(self.L, self.M))
+        b = np.zeros((self.L, self.M), dtype=float)
+        for l in range(self.L):
+            for k in range(self.K):
+                m = m_sel[l, k]
+                if m >= 0:
+                    b[l, m] += r[l, k] * 1.0  # Δt = 1
+
+        for l in range(self.L):
+            for m in range(self.M):
+                self.Q[l, m] = queue_update(self.Q[l, m], b[l, m], A[l, m])
+
+        # Virtual power queues H for scheduled links:
+        # Use link transmit component as P_tilde (p_sel/eps); unscheduled links unchanged.
+        for l in range(self.L):
+            for k in range(self.K):
+                m = m_sel[l, k]
+                if m >= 0:
+                    P_tilde_lm = p_sel[l, k] / max(self.eps, 1e-12)
+                    self.H[l, m] = virtual_power_update(
+                        self.H[l, m], P_tilde=P_tilde_lm, P_T=self.P_T
+                    )
+
+        # Reward = system EE over the slot
+        sum_rates = float(np.sum(r))
+        sum_Po = float(np.sum(rrh_Po))
+        reward = eta_EE(self.omega, sum_rates, self.mu, sum_Po)
+
+        # Stats
+        self._ep_reward_sum += reward
+        self._ep_reward_min = min(self._ep_reward_min, reward)
+        self._ep_reward_max = max(self._ep_reward_max, reward)
+        Lphi = lyapunov_L(self.Q, self.H)
+
+        # Advance time: new slot, new channels
+        self._episode_steps += 1
+        self._t += 1
+        self._draw_channels()
+
+        obs = self._build_obs()
+        terminated = False
+        truncated = self._episode_steps >= self.episode_len
+        info = {
+            "ok": True,
+            "sum_rates": sum_rates,
+            "sum_Po": sum_Po,
+            "lyapunov": float(Lphi),
+            "episode_reward_sum": float(self._ep_reward_sum),
+            "episode_reward_min": float(self._ep_reward_min),
+            "episode_reward_max": float(self._ep_reward_max),
+            "t": self._t,
+            "episode_steps": self._episode_steps,
+        }
+        return obs, reward, terminated, truncated, info
+
+    def render(self):
+        pass
+
+    def close(self):
+        pass
 
 
-def observe():  # returns the observation space with the indicated parameters
-    return np.concatenate([S["phi"], S["E"], S["U"], S["prev_ch"]]).astype(np.float32)
+# ----------------------- Smoke test -----------------------
+if __name__ == "__main__":
+    env = MECEnvDDRL({"seed": 42})
+    obs, info = env.reset()
+    print("Reset OK:", obs.shape, info)
 
-
-def decode_action(idx: int):
-    l, m, k, p_idx, x = actions[idx]
-    p = power_watts[p_idx]
-    return l, m, k, p, x
+    total = 0.0
+    invalids = 0
+    for i in range(1000):
+        for t in range(20):
+            a = env.action_space.sample()
+            obs, r, term, trunc, info = env.step(a)
+            total += r
+            if not info.get("ok", False):
+                invalids += 1
+            if trunc or term:
+                obs, info = env.reset()
+        # print("Random rollout done. reward_sum=", total, "invalids=", invalids)
+    print(invalids if invalids < 20 else None)
