@@ -33,6 +33,28 @@ def virtual_power_update(H, P_tilde, P_T):
     return max(H - P_tilde + P_T, 0.0)
 
 
+def E_local(xi, f_m, L_l):
+    # Eq. (2): E_lo = xi * f_m^2 * L_l
+    return float(xi * (f_m**2) * L_l)
+
+
+def T_local(f_m, psi_lo_m):
+    # Paper definition (Sec. C-1): T_lo = f_m / psi_lo_m
+    return float(f_m / max(psi_lo_m, 1e-12))
+
+
+def E_offload(p_m, f_m, psi_off_m):
+    # Eq. (3): E_off = (p_m / f_m) * psi_off_m
+    return float((p_m / max(f_m, 1e-12)) * psi_off_m)
+
+
+def T_offload(p_m, f_m, psi_off_m, d_m, r_m):
+    # Sec. C-2: T_off = (p_m/f_m)*psi_off_m + d_m / r_m
+    t_comp = (p_m / max(f_m, 1e-12)) * psi_off_m
+    t_tx = d_m / max(r_m, 1e-12)
+    return float(t_comp + t_tx)
+
+
 def eta_EE(omega, sum_rate, mu, sum_Po):
     denom = max(mu * sum_Po, 1e-20)
     return (omega * sum_rate) / denom
@@ -42,24 +64,7 @@ def lyapunov_L(Q, H):
     return float(0.5 * (np.sum(Q**2) + np.sum(H**2)))
 
 
-# ---------- Environment: joint per-slot action ----------
-
-
 class MECEnvDDRL(gym.Env):
-    """
-    Joint scheduling & power per slot:
-      - For each (RRH l, subchannel k), choose: idle OR (device m, power level)
-      - Enforces:
-          C1: RRH per-slot total power ≤ p_max
-          C2: per-link rate ≥ r_min (for scheduled links)
-          C3: per-subchannel interference threshold I_k at every RRH receiver
-          C4: exclusivity: at most one device per (l,k) and each device used by at most one RRH (single association)
-      - Updates:
-          Queues Q[l,m] by (7) for all pairs (scheduled: b>0; unscheduled: b=0)
-          Virtual queues H[l,m] by (17) for scheduled links using link transmit component
-      - Reward:
-          System energy-efficiency per slot: (ω * Σ rates) / (μ * Σ RRH total power)
-    """
 
     metadata = {"render_modes": []}
 
@@ -73,6 +78,44 @@ class MECEnvDDRL(gym.Env):
         self.W_total = float(cfg.get("bandwidth", 40e6))
         self.W_sub = self.W_total / self.K
         self.sigma2 = float(cfg.get("noise", 1e-13))  # ~ -100 dBm
+        # CPU capability f_m (cycles/s)
+        self.f_m = np.array(
+            cfg.get("f_m", np.full(self.M, 2.0e9)),  # default 2 GHz per device
+            dtype=float,
+        )
+
+        # Task load L_l (dimensionless task-load term used with f_m^2); allow per-device for flexibility
+        self.L_l = np.array(
+            cfg.get(
+                "L_l", np.full(self.M, 1.0e-9)
+            ),  # small scale so energies are in a reasonable range
+            dtype=float,
+        )
+
+        # Energy coefficient xi (chip/architecture dependent)
+        self.xi = float(cfg.get("xi", 1.0e-27))
+
+        # Required compute resources for local/offload branches (psi)
+        self.psi_lo = np.array(
+            cfg.get("psi_lo", np.full(self.M, 1.0e8)),  # cycles needed locally
+            dtype=float,
+        )
+        self.psi_off = np.array(
+            cfg.get("psi_off", np.full(self.M, 5.0e7)),  # cycles needed at MEC path
+            dtype=float,
+        )
+
+        # Input data size d_m (bits) for offloading latency model
+        self.d_m = np.array(
+            cfg.get("d_m", np.full(self.M, 1.0e6)),  # 1 Mbit per task by default
+            dtype=float,
+        )
+
+        # For convenience we’ll also track rolling per-slot r_m and p_m
+        self._r_m_last = np.zeros(self.M, dtype=float)
+        self._p_m_last = np.zeros(
+            self.M, dtype=float
+        )  # interpreted as device uplink power for Eq. (3)
 
         # Constraints
         self.p_max = float(cfg.get("p_max", 2.0))  # per-RRH power cap (per slot)
@@ -132,8 +175,6 @@ class MECEnvDDRL(gym.Env):
 
         # Initialize channels
         self._draw_channels()
-
-    # ---------- helpers ----------
 
     def _draw_channels(self):
         self.h[:, :] = self._rng.rayleigh(scale=1.0, size=(self.L, self.M))
@@ -350,6 +391,49 @@ class MECEnvDDRL(gym.Env):
                         self.H[l, m], P_tilde=P_tilde_lm, P_T=self.P_T
                     )
 
+        # Collapse per-(l,k) rates/powers to per-device r_m and p_m (sum over any scheduled subchannels)
+        r_m = np.zeros(self.M, dtype=float)
+        p_m = np.zeros(self.M, dtype=float)
+        for l in range(self.L):
+            for k in range(self.K):
+                m = m_sel[l, k]
+                if m >= 0:
+                    r_m[m] += r[l, k]  # total achieved rate for device m this slot
+                    p_m[m] += p_sel[
+                        l, k
+                    ]  # interpret scheduled power as uplink p_m for Eq. (3)
+
+        # Paper Eq. (2)-(4): per-device energies/latencies
+        E_lo_m = np.array(
+            [E_local(self.xi, self.f_m[m], self.L_l[m]) for m in range(self.M)],
+            dtype=float,
+        )
+        T_lo_m = np.array(
+            [T_local(self.f_m[m], self.psi_lo[m]) for m in range(self.M)], dtype=float
+        )
+        E_off_m = np.array(
+            [E_offload(p_m[m], self.f_m[m], self.psi_off[m]) for m in range(self.M)],
+            dtype=float,
+        )
+        T_off_m = np.array(
+            [
+                T_offload(
+                    p_m[m],
+                    self.f_m[m],
+                    self.psi_off[m],
+                    self.d_m[m],
+                    max(r_m[m], 1e-12),
+                )
+                for m in range(self.M)
+            ],
+            dtype=float,
+        )
+
+        E_T_m = E_lo_m + E_off_m  # Eq. (4)
+        # Save for info/debug
+        self._r_m_last[:] = r_m
+        self._p_m_last[:] = p_m
+
         # Reward = system EE over the slot
         sum_rates = float(np.sum(r))
         sum_Po = float(np.sum(rrh_Po))
@@ -379,6 +463,13 @@ class MECEnvDDRL(gym.Env):
             "episode_reward_max": float(self._ep_reward_max),
             "t": self._t,
             "episode_steps": self._episode_steps,
+            "r_m": self._r_m_last.copy(),
+            "p_m": self._p_m_last.copy(),
+            "E_local_sum": float(np.sum(E_lo_m)),
+            "E_off_sum": float(np.sum(E_off_m)),
+            "E_total_sum": float(np.sum(E_T_m)),
+            "T_local_avg": float(np.mean(T_lo_m)),
+            "T_off_avg": float(np.mean(T_off_m)),
         }
         return obs, reward, terminated, truncated, info
 
@@ -407,4 +498,10 @@ if __name__ == "__main__":
             if trunc or term:
                 obs, info = env.reset()
         # print("Random rollout done. reward_sum=", total, "invalids=", invalids)
-    print(invalids if invalids < 20 else None)
+        print(
+            "Example slot paper-metrics:",
+            "E_total_sum=",
+            info.get("E_total_sum"),
+            "T_off_avg=",
+            info.get("T_off_avg"),
+        )
